@@ -36,10 +36,19 @@ services:
     # the next request wakes the service. 0.5c-512mb (~$7/mo) is the smallest always-on plan.
     plan: 0.5c-512mb
     # Pin pnpm to the version that generated pnpm-lock.yaml (pnpm-workspace.yaml's
-    # minimumReleaseAge needs pnpm >= 10.16; the lockfile was written by 11.x). The filtered install
-    # pulls only the API and the seed script plus their workspace deps — not three.js, face-api and
-    # the rest of the game dependencies, which the API never uses.
-    buildCommand: npm install -g pnpm@11.5.3 && pnpm install --frozen-lockfile --filter @workspace/api-server... --filter @workspace/scripts... && pnpm run build:api
+    # minimumReleaseAge needs pnpm >= 10.16; the lockfile was written by 11.x). It has to go into a
+    # writable prefix: Render's image already ships a pnpm under /usr/lib/node_modules and /usr is
+    # read-only at build time, so a plain `npm install -g` fails with EROFS. The nested `pnpm` calls
+    # in scripts/build-*.mjs resolve through PATH, hence the export. The first echo just records the
+    # image's own pnpm version in the build log. The filtered install pulls only the API and the seed
+    # script plus their workspace deps — not three.js, face-api and the rest of the game
+    # dependencies, which the API never uses.
+    buildCommand: >-
+      echo "pnpm on image: $(pnpm -v 2>/dev/null || echo none)"
+      && npm install -g --prefix "${HOME:-/opt/render}/.npm-global" pnpm@11.5.3
+      && export PATH="${HOME:-/opt/render}/.npm-global/bin:$PATH"
+      && pnpm install --frozen-lockfile --filter @workspace/api-server... --filter @workspace/scripts...
+      && pnpm run build:api
     startCommand: node --enable-source-maps artifacts/api-server/dist/index.mjs
     healthCheckPath: /api/healthz
     # One-time bootstrap after the first successful deploy: create the schema on the empty
@@ -77,7 +86,13 @@ services:
     # build:web = site first, then every game staged into the site's dist at its own base path.
     # Order is load-bearing (the site's vite config empties its outDir). Takes 5–8 minutes; the
     # build machine has 8 GB RAM, which covers the 4 GB heap the game builds request.
-    buildCommand: npm install -g pnpm@11.5.3 && pnpm install --frozen-lockfile && pnpm run build:web
+    # Same writable-prefix pnpm install as the API service above (/usr is read-only).
+    buildCommand: >-
+      echo "pnpm on image: $(pnpm -v 2>/dev/null || echo none)"
+      && npm install -g --prefix "${HOME:-/opt/render}/.npm-global" pnpm@11.5.3
+      && export PATH="${HOME:-/opt/render}/.npm-global/bin:$PATH"
+      && pnpm install --frozen-lockfile
+      && pnpm run build:web
     staticPublishPath: artifacts/citrus-landing/dist/public
     buildFilter:
       ignoredPaths:
