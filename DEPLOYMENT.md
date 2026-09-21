@@ -140,3 +140,95 @@ The basketball game ships ~66MB of video (`client/public/newbb/*.mp4`,
 bandwidth for anyone who opens that game. If bills become a concern, the fix is
 to move those files to a video host and reference them by URL rather than
 bundling them into the build.
+
+---
+
+# Deploying to Render instead
+
+`render.yaml` at the repo root is a Render Blueprint that reproduces the same
+split on a single host:
+
+| Piece | Render resource | Name in the Blueprint |
+| --- | --- | --- |
+| `citrus-landing` + all 5 game builds | Static Site (global CDN, free) | `requisor-site` |
+| `@workspace/api-server` | Web Service (Node 24) | `requisor-api` |
+| Postgres | Render Postgres | `requisor-db` |
+
+The site's `/api/*` rewrite proxies to the API service, so, exactly as with
+Vercel, the browser only talks to one origin and nothing about the API is
+baked into the client bundle.
+
+## 1. Apply the Blueprint
+
+Render Dashboard → **New → Blueprint** → pick this repo. Render reads
+`render.yaml`, shows the three resources, and prompts for the one secret that
+is marked `sync: false`:
+
+| Prompt | Value |
+| --- | --- |
+| `XAI_API_KEY` | your xAI key — only needed for Boat Booth's AI scene generation; leave blank otherwise |
+
+Click **Apply**. Render creates the database first, then builds both
+services in parallel. The API build is quick; the site build takes 5–8 minutes
+(site plus five games).
+
+## 2. Confirm the API hostname
+
+Render gives each service `https://<name>.onrender.com`, but appends a random
+suffix (`requisor-api-xxxx`) if `requisor-api` is already taken by someone
+else's workspace. Open the API service in the dashboard and compare its URL to
+the `/api/*` rewrite destination in `render.yaml`. If they differ, update the
+destination, commit, and push — the static site redeploys automatically.
+
+Then confirm the API is up:
+
+```bash
+curl https://requisor-api.onrender.com/api/healthz
+```
+
+## 3. Database
+
+The API's `initialDeployHook` runs once after its first successful deploy and
+executes `pnpm run db:push && pnpm run db:seed` against the new database, so
+a fresh Blueprint comes up with the schema and the five game rows already in
+place. Check the API service's **Events** tab for the hook's log.
+
+If the hook failed, or for **every later schema change**, push from your
+machine using the database's *External* connection string (dashboard → the
+database → Connect):
+
+```bash
+DATABASE_URL="postgres://...render.com/requisor?sslmode=require" pnpm run db:push
+DATABASE_URL="postgres://...render.com/requisor?sslmode=require" pnpm run db:seed
+```
+
+Schema pushes are deliberately not automated on every deploy: `drizzle-kit
+push` prompts for confirmation on destructive diffs, which would hang a
+pre-deploy step.
+
+## 4. Verify
+
+Same checklist as the Vercel deploy above, against the static site's URL:
+
+- `/` — landing page loads, game catalog populated (proves the `/api/*` rewrite works)
+- `/games` — 5 cards
+- Customize any game — the preview iframe themes live as you change colors
+- `/game-previews/boat-booth/create` — loads on a hard refresh (proves rewrite 2)
+
+## Plans and cost
+
+The Blueprint picks the smallest **paid** tiers, because the free ones break
+this app in non-obvious ways:
+
+| Resource | Blueprint plan | What `free` would do |
+| --- | --- | --- |
+| `requisor-api` | `0.5c-512mb` (~$7/mo) | spins down after 15 idle minutes: ~1 min cold start on the customizer's first API call, and Boat Booth's background video polling dies mid-job until the next request wakes the service |
+| `requisor-db` | `0.1c-256mb` (~$6/mo) | expires 30 days after creation, no backups, deleted 14 days later with all drafts, orders and Boat Booth media |
+| `requisor-site` | static sites are always free | — |
+
+For a throwaway demo, change both `plan:` lines to `free` and re-apply.
+
+Each push builds both services unless `buildFilter` rules it out: the API
+ignores site/game paths and the site ignores the API path, so a site-only
+commit does not rebuild the API and vice versa. Builds consume Render pipeline
+minutes (500/month on Hobby); the 5–8 minute site build is the one to watch.
