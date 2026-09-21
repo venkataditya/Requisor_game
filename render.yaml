@@ -38,11 +38,14 @@ services:
     # Pin pnpm to the version that generated pnpm-lock.yaml (pnpm-workspace.yaml's
     # minimumReleaseAge needs pnpm >= 10.16; the lockfile was written by 11.x). It has to go into a
     # writable prefix: Render's image already ships a pnpm under /usr/lib/node_modules and /usr is
-    # read-only at build time, so a plain `npm install -g` fails with EROFS. The nested `pnpm` calls
-    # in scripts/build-*.mjs resolve through PATH, hence the export. The first echo just records the
-    # image's own pnpm version in the build log. The filtered install pulls only the API and the seed
-    # script plus their workspace deps — not three.js, face-api and the rest of the game
-    # dependencies, which the API never uses.
+    # read-only at build time, so any `npm install -g pnpm` aimed at the default prefix fails with
+    # EROFS. That is also why root package.json deliberately has NO `packageManager` field and why
+    # SKIP_INSTALL_DEPS is set below: Render runs its own dependency/package-manager step before
+    # buildCommand for Node services, and it hit exactly that EROFS. The nested `pnpm` calls in
+    # scripts/build-*.mjs resolve through PATH, hence the export. The first echo records the image's
+    # own pnpm version in the build log. The filtered install pulls only the API and the seed script
+    # plus their workspace deps — not three.js, face-api and the rest of the game dependencies,
+    # which the API never uses.
     buildCommand: >-
       echo "pnpm on image: $(pnpm -v 2>/dev/null || echo none)"
       && npm install -g --prefix "${HOME:-/opt/render}/.npm-global" pnpm@11.5.3
@@ -63,6 +66,8 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "24"
+      - key: SKIP_INSTALL_DEPS
+        value: "true"
       - key: NODE_ENV
         value: production
       - key: DATABASE_URL
