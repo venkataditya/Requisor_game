@@ -5,7 +5,7 @@ import express, { Router, type IRouter } from "express";
 // The bundled server always lands at `artifacts/api-server/dist/index.mjs`
 // (see build.mjs), so three levels up from this file's runtime directory is
 // the repo root regardless of dev vs. prod.
-const repoRoot = path.resolve(import.meta.dirname, "../../..");
+export const repoRoot = path.resolve(import.meta.dirname, "../../..");
 
 // Every game's static build is mounted here so the branding customizer can
 // embed it in a live, re-themeable iframe — each implements the
@@ -48,6 +48,8 @@ const GAME_PREVIEWS: { slug: string; distDir: string }[] = [
     ),
   },
 ];
+
+export const GAME_PREVIEW_SLUGS: readonly string[] = GAME_PREVIEWS.map((g) => g.slug);
 
 const router: IRouter = Router();
 

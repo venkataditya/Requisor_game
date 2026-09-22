@@ -1,0 +1,12 @@
+.git
+.gstack
+docs
+node_modules
+**/node_modules
+**/dist
+**/.pglite-data
+.pglite-data
+Dockerfile
+render.yaml
+vercel.json
+railway.json

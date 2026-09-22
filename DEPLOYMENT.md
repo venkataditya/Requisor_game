@@ -145,90 +145,94 @@ bundling them into the build.
 
 # Deploying to Render instead
 
-`render.yaml` at the repo root is a Render Blueprint that reproduces the same
-split on a single host:
+`render.yaml` at the repo root is a Render Blueprint. Unlike the Vercel +
+Railway split above, it runs everything as **one Docker web service** plus a
+Postgres instance:
 
 | Piece | Render resource | Name in the Blueprint |
 | --- | --- | --- |
-| `citrus-landing` + all 5 game builds | Static Site (global CDN, free) | `requisor-site` |
-| `@workspace/api-server` | Web Service (Node 24) | `requisor-api` |
+| API + `citrus-landing` + all 5 game builds | Web Service (Docker, `./Dockerfile`) | `requisor-api` |
 | Postgres | Render Postgres | `requisor-db` |
 
-The site's `/api/*` rewrite proxies to the API service, so, exactly as with
-Vercel, the browser only talks to one origin and nothing about the API is
-baked into the client bundle.
+**Why one service.** Render's native Node build image (September 2026)
+reinstalls pnpm into the read-only `/usr` tree before the build command runs
+and fails with `EROFS`, whatever the repo says. The Dockerfile sidesteps
+Render's Node tooling entirely, and in production the API serves the built
+site and the staged game previews itself
+(`artifacts/api-server/src/lib/site-static.ts`, mounted from `app.ts` when
+`NODE_ENV=production` and the site build exists next to the bundle). One
+origin, so no `/api/*` rewrite and no hostname to check. The trade-off is
+that game videos are served by the Node container rather than a CDN; for
+booth-scale traffic that is fine, and the static-site layout can come back
+once Render fixes their image.
 
 ## 1. Apply the Blueprint
 
-Render Dashboard → **New → Blueprint** → pick this repo. Render reads
-`render.yaml`, shows the three resources, and prompts for the one secret that
-is marked `sync: false`:
+Render Dashboard → **New → Blueprint** → this repo, on the branch that holds
+`render.yaml`. Render prompts for the one secret marked `sync: false`:
 
 | Prompt | Value |
 | --- | --- |
-| `XAI_API_KEY` | your xAI key — only needed for Boat Booth's AI scene generation; leave blank otherwise |
+| `XAI_API_KEY` | your xAI key — only needed for Boat Booth's AI scene generation; any placeholder otherwise |
 
-Click **Apply**. Render creates the database first, then builds both
-services in parallel. The API build is quick; the site build takes 5–8 minutes
-(site plus five games).
+Click **Apply**. The first build takes roughly ten minutes (a full workspace
+install, the site, five games, the API bundle). Later builds reuse Docker
+layers and are quicker unless `pnpm-lock.yaml` changed.
 
-## 2. Confirm the API hostname
+If the Blueprint already exists from the earlier attempt, pushing the new
+`render.yaml` re-syncs it and `requisor-api` switches from the Node runtime
+to Docker in place. The old `requisor-site` static site is no longer in the
+file; Render leaves removed resources alone, so delete it from the dashboard
+once `requisor-api` is healthy.
 
-Render gives each service `https://<name>.onrender.com`, but appends a random
-suffix (`requisor-api-xxxx`) if `requisor-api` is already taken by someone
-else's workspace. Open the API service in the dashboard and compare its URL to
-the `/api/*` rewrite destination in `render.yaml`. If they differ, update the
-destination, commit, and push — the static site redeploys automatically.
+## 2. Database (one-time, from your machine)
 
-Then confirm the API is up:
-
-```bash
-curl https://requisor-api.onrender.com/api/healthz
-```
-
-## 3. Database
-
-The API's `initialDeployHook` runs once after its first successful deploy and
-executes `pnpm run db:push && pnpm run db:seed` against the new database, so
-a fresh Blueprint comes up with the schema and the five game rows already in
-place. Check the API service's **Events** tab for the hook's log.
-
-If the hook failed, or for **every later schema change**, push from your
-machine using the database's *External* connection string (dashboard → the
-database → Connect):
+The runtime image carries the built bundles but no pnpm or drizzle-kit, so
+schema and seed are pushed from your machine using the database's **External**
+connection string
+(dashboard → `requisor-db` → Connect):
 
 ```bash
 DATABASE_URL="postgres://...render.com/requisor?sslmode=require" pnpm run db:push
 DATABASE_URL="postgres://...render.com/requisor?sslmode=require" pnpm run db:seed
 ```
 
-Schema pushes are deliberately not automated on every deploy: `drizzle-kit
-push` prompts for confirmation on destructive diffs, which would hang a
-pre-deploy step.
+Repeat `db:push` for every later schema change. Until the first push runs,
+`/api/games` returns a 500 and the catalog is empty.
 
-## 4. Verify
+## 3. Verify
 
-Same checklist as the Vercel deploy above, against the static site's URL:
+Read the service URL from the dashboard (Render suffixes the subdomain when
+`requisor-api` is taken), then:
 
-- `/` — landing page loads, game catalog populated (proves the `/api/*` rewrite works)
+```bash
+curl https://YOUR-SERVICE.onrender.com/api/healthz
+```
+
+- `/` — landing page loads, game catalog populated
 - `/games` — 5 cards
 - Customize any game — the preview iframe themes live as you change colors
-- `/game-previews/boat-booth/create` — loads on a hard refresh (proves rewrite 2)
+- `/game-previews/boat-booth/create` — loads on a hard refresh
 
 ## Plans and cost
 
-The Blueprint picks the smallest **paid** tiers, because the free ones break
-this app in non-obvious ways:
-
 | Resource | Blueprint plan | What `free` would do |
 | --- | --- | --- |
-| `requisor-api` | `0.5c-512mb` (~$7/mo) | spins down after 15 idle minutes: ~1 min cold start on the customizer's first API call, and Boat Booth's background video polling dies mid-job until the next request wakes the service |
+| `requisor-api` | `0.5c-512mb` (~$7/mo) | spins down after 15 idle minutes: ~1 min cold start, and Boat Booth's background video polling dies mid-job until the next request wakes the service |
 | `requisor-db` | `0.1c-256mb` (~$6/mo) | expires 30 days after creation, no backups, deleted 14 days later with all drafts, orders and Boat Booth media |
-| `requisor-site` | static sites are always free | — |
 
-For a throwaway demo, change both `plan:` lines to `free` and re-apply.
+Game videos (the basketball game alone ships ~66 MB) now leave through the
+web service and count against the workspace's outbound bandwidth allowance.
 
-Each push builds both services unless `buildFilter` rules it out: the API
-ignores site/game paths and the site ignores the API path, so a site-only
-commit does not rebuild the API and vice versa. Builds consume Render pipeline
-minutes (500/month on Hobby); the 5–8 minute site build is the one to watch.
+## Building the image locally
+
+```bash
+docker build --platform linux/amd64 -t requisor-game .
+docker run --rm -e PORT=10000 -p 10000:10000 -e DATABASE_URL="postgres://..." requisor-game
+```
+
+`--platform linux/amd64` is mandatory on Apple Silicon: `pnpm-workspace.yaml`
+strips every native binary except linux-x64 (and the Windows ones listed in the
+root `package.json`), so a linux/arm64 image cannot build. Without
+`DATABASE_URL` the container falls back to PGlite inside its ephemeral
+filesystem, which is fine for a smoke test.

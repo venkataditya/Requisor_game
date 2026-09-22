@@ -1,16 +1,17 @@
-# Render Blueprint — deploys the whole project to Render in one "New → Blueprint" click.
-# Mirrors the Vercel + Railway split described in DEPLOYMENT.md:
+# Render Blueprint — one Docker web service plus Postgres.
 #
-#   requisor-site  static site   the marketing site + customizer + all 5 game builds (global CDN)
-#   requisor-api   web service   Express API under /api (Boat Booth, catalog, branding drafts)
-#   requisor-db    Postgres      DATABASE_URL for the API
+#   requisor-api   web service (Docker)   Express API under /api AND the static site + game
+#                                         previews, all served from one container
+#   requisor-db    Postgres               DATABASE_URL for the API
 #
-# The browser only ever talks to the static site's origin: the site's /api/* rewrite proxies to
-# the API service, so there is no CORS setup and no API URL baked into the client bundle.
+# History: the first version used Render's native Node runtime with a separate static site and an
+# /api/* rewrite. Render's Node build image (Sept 2026) reinstalls pnpm into the read-only /usr
+# before the build command runs and fails with EROFS regardless of repo configuration, so the
+# build moved into ./Dockerfile and the API now serves the built site itself
+# (artifacts/api-server/src/lib/site-static.ts). One origin, no rewrite, no hostname to check.
 #
-# AFTER THE FIRST DEPLOY: confirm the API's real hostname. Render appends a random suffix
-# (requisor-api-xxxx.onrender.com) when the subdomain is already taken by another workspace; if
-# that happened, update the /api/* rewrite destination below to the real host and push.
+# The old `requisor-site` static site is no longer defined here. Render does not delete resources
+# that disappear from a Blueprint; remove it from the dashboard by hand once requisor-api is up.
 #
 # Reference: https://render.com/docs/blueprint-spec
 
@@ -24,50 +25,22 @@ databases:
     user: requisor
 
 services:
-  # ---------------------------------------------------------------------------------------------
-  # API — everything under /api
-  # ---------------------------------------------------------------------------------------------
   - type: web
+    # Keeps the identity of the service the first Blueprint created; only its runtime changes.
     name: requisor-api
-    runtime: node
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     region: oregon            # must match the database's region for the internal DATABASE_URL
-    # `free` (0.1 CPU) works for demos but spins down after 15 idle minutes: the customizer's first
-    # API call then waits ~1 minute, and Boat Booth's background video polling dies mid-job until
-    # the next request wakes the service. 0.5c-512mb (~$7/mo) is the smallest always-on plan.
+    # `free` (0.1 CPU) works for demos but spins down after 15 idle minutes: the first request then
+    # waits ~1 minute, and Boat Booth's background video polling dies mid-job until the next request
+    # wakes the service. 0.5c-512mb (~$7/mo) is the smallest always-on plan.
     plan: 0.5c-512mb
-    # Pin pnpm to the version that generated pnpm-lock.yaml (pnpm-workspace.yaml's
-    # minimumReleaseAge needs pnpm >= 10.16; the lockfile was written by 11.x). It has to go into a
-    # writable prefix: Render's image already ships a pnpm under /usr/lib/node_modules and /usr is
-    # read-only at build time, so any `npm install -g pnpm` aimed at the default prefix fails with
-    # EROFS. That is also why root package.json deliberately has NO `packageManager` field and why
-    # SKIP_INSTALL_DEPS is set below: Render runs its own dependency/package-manager step before
-    # buildCommand for Node services, and it hit exactly that EROFS. The nested `pnpm` calls in
-    # scripts/build-*.mjs resolve through PATH, hence the export. The first echo records the image's
-    # own pnpm version in the build log. The filtered install pulls only the API and the seed script
-    # plus their workspace deps — not three.js, face-api and the rest of the game dependencies,
-    # which the API never uses.
-    buildCommand: >-
-      echo "pnpm on image: $(pnpm -v 2>/dev/null || echo none)"
-      && npm install -g --prefix "${HOME:-/opt/render}/.npm-global" pnpm@11.5.3
-      && export PATH="${HOME:-/opt/render}/.npm-global/bin:$PATH"
-      && pnpm install --frozen-lockfile --filter @workspace/api-server... --filter @workspace/scripts...
-      && pnpm run build:api
-    startCommand: node --enable-source-maps artifacts/api-server/dist/index.mjs
     healthCheckPath: /api/healthz
-    # One-time bootstrap after the first successful deploy: create the schema on the empty
-    # database and seed the 5 game rows. Later schema changes are pushed by hand (see
-    # DEPLOYMENT.md → Render → Database) because `drizzle-kit push` prompts on destructive diffs.
-    initialDeployHook: pnpm run db:push && pnpm run db:seed
-    buildFilter:
-      ignoredPaths:
-        - artifacts/citrus-landing/**
-        - artifacts/games/**
-        - artifacts/mockup-sandbox/**
+    # Schema + seed are a one-time manual step from your machine against the database's external
+    # URL (DEPLOYMENT.md → Render → Database): the runtime image carries the built bundles and the
+    # one package they link at startup, not pnpm or drizzle-kit, so there is no initialDeployHook.
     envVars:
-      - key: NODE_VERSION
-        value: "24"
-      - key: SKIP_INSTALL_DEPS
-        value: "true"
       - key: NODE_ENV
         value: production
       - key: DATABASE_URL
@@ -75,56 +48,7 @@ services:
           name: requisor-db
           property: connectionString
       # Only needed for Boat Booth's AI scene generation; the rest of the API runs without it.
-      # Render prompts for the value in the dashboard when the Blueprint is first applied.
+      # Render prompts for the value when the Blueprint is first applied and keeps it on updates.
       - key: XAI_API_KEY
         sync: false
     # PORT is injected by Render (10000); the server reads it and refuses to start without it.
-
-  # ---------------------------------------------------------------------------------------------
-  # Site — marketing pages, customizer, and /game-previews/<slug>/ for all five games
-  # ---------------------------------------------------------------------------------------------
-  - type: web
-    name: requisor-site
-    runtime: static
-    # Render would otherwise auto-run its own dependency install before buildCommand; disable that
-    # (SKIP_INSTALL_DEPS below) so the pinned pnpm does the one and only install.
-    # build:web = site first, then every game staged into the site's dist at its own base path.
-    # Order is load-bearing (the site's vite config empties its outDir). Takes 5–8 minutes; the
-    # build machine has 8 GB RAM, which covers the 4 GB heap the game builds request.
-    # Same writable-prefix pnpm install as the API service above (/usr is read-only).
-    buildCommand: >-
-      echo "pnpm on image: $(pnpm -v 2>/dev/null || echo none)"
-      && npm install -g --prefix "${HOME:-/opt/render}/.npm-global" pnpm@11.5.3
-      && export PATH="${HOME:-/opt/render}/.npm-global/bin:$PATH"
-      && pnpm install --frozen-lockfile
-      && pnpm run build:web
-    staticPublishPath: artifacts/citrus-landing/dist/public
-    buildFilter:
-      ignoredPaths:
-        - artifacts/api-server/**
-    envVars:
-      - key: NODE_VERSION
-        value: "24"
-      - key: SKIP_INSTALL_DEPS
-        value: "true"
-    # Render serves a real file when one exists at the path and only then consults these rules,
-    # so hashed JS/CSS chunks, videos and images never hit the rewrites.
-    routes:
-      # 1. API → the web service above. Update the host if Render suffixed the service name.
-      - type: rewrite
-        source: /api/*
-        destination: https://requisor-api.onrender.com/api/*
-      # 2. Boat Booth is the only game with client-side routes (/ and /create); a hard refresh of
-      #    /create must fall back to that game's own index.html, not the site's.
-      - type: rewrite
-        source: /game-previews/boat-booth/*
-        destination: /game-previews/boat-booth/index.html
-      # 3. Everything else is the site's SPA fallback.
-      - type: rewrite
-        source: /*
-        destination: /index.html
-    headers:
-      # Vite emits content-hashed filenames under /assets, so they can be cached forever.
-      - path: /assets/*
-        name: Cache-Control
-        value: public, max-age=31536000, immutable
